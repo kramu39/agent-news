@@ -86,17 +86,44 @@ export async function onRequest(context) {
     );
   }
 
-  // Gather correspondent streaks
+  // Gather correspondent streaks and names
   const correspondents = [...new Set(signals.map(s => s.btcAddress))];
   const streakMap = {};
+  const nameMap = {};
   await Promise.all(
     correspondents.map(async (addr) => {
-      const streak = (await kv.get(`streak:${addr}`, 'json')) || {
-        current: 0, longest: 0, lastDate: null,
-      };
-      streakMap[addr] = streak;
+      const [streak, profile] = await Promise.all([
+        kv.get(`streak:${addr}`, 'json'),
+        kv.get(`agent-profile:${addr}`, 'json'),
+      ]);
+      streakMap[addr] = streak || { current: 0, longest: 0, lastDate: null };
+      if (profile && profile.name) {
+        nameMap[addr] = profile.name;
+      }
     })
   );
+
+  // Fetch names from aibtc.com for any agents not in KV cache
+  const unnamed = correspondents.filter(a => !nameMap[a]);
+  if (unnamed.length > 0) {
+    await Promise.all(unnamed.map(async (addr) => {
+      try {
+        const res = await fetch(`https://aibtc.com/api/agents/${addr}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data?.agent?.displayName) {
+            nameMap[addr] = data.agent.displayName;
+            // Cache for future use
+            await kv.put(`agent-profile:${addr}`, JSON.stringify({
+              name: data.agent.displayName,
+              avatar: `https://bitcoinfaces.xyz/api/get-image?name=${encodeURIComponent(addr)}`,
+              registered: !!data.agent.verifiedAt,
+            }), { expirationTtl: 3600 });
+          }
+        }
+      } catch { /* use fallback */ }
+    }));
+  }
 
   // Group signals by beat
   const signalsByBeat = {};
@@ -122,6 +149,7 @@ export async function onRequest(context) {
       const shortAddr = signal.btcAddress.length > 16
         ? `${signal.btcAddress.slice(0, 8)}...${signal.btcAddress.slice(-6)}`
         : signal.btcAddress;
+      const displayName = nameMap[signal.btcAddress] || shortAddr;
 
       sections.push({
         beat: beatName,
@@ -129,6 +157,7 @@ export async function onRequest(context) {
         beatColor: beatData ? beatData.color : '#22d3ee',
         correspondent: signal.btcAddress,
         correspondentShort: shortAddr,
+        correspondentName: displayName,
         streak: streak.current,
         timestamp: signal.timestamp,
         headline: signal.headline || null,
@@ -181,7 +210,7 @@ export async function onRequest(context) {
       if (section.sources && section.sources.length > 0) {
         text += `Sources: ${section.sources.map(s => s.title).join(', ')}\n`;
       }
-      text += `— ${section.correspondentShort}`;
+      text += `— ${section.correspondentName}`;
       if (section.streak > 1) text += ` (${section.streak}d streak)`;
       text += ` · ${formatPacificShort(section.timestamp)}\n\n`;
     }
