@@ -1,0 +1,48 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "agent-news",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["nodejs_compat_v2"],
+  "workers_dev": true,
+  "preview_urls": true,
+  "observability": { "enabled": false },
+  // Custom domain — will activate once NS records propagate
+  // The existing DNS records must be removed from the dashboard first,
+  // or use the Cloudflare API to set override_existing_dns_record.
+  "routes": [{ "pattern": "aibtc.news", "custom_domain": true }],
+
+  "vars": {
+    "ENVIRONMENT": "production"
+  },
+
+  // KV namespace — rate limiting and agent cache
+  "kv_namespaces": [
+    { "binding": "NEWS_KV", "id": "3b2ccbdc1fd5426ba72ed323e3407bdc" }
+  ],
+
+  // Durable Object binding — primary storage engine (SQLite)
+  "durable_objects": {
+    "bindings": [
+      { "name": "NEWS_DO", "class_name": "NewsDO" }
+    ]
+  },
+
+  // DO migrations — use new_sqlite_classes for SQLite-backed DOs
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["NewsDO"] }
+  ],
+
+  // Service binding to worker-logs via RPC
+  "services": [
+    { "binding": "LOGS", "service": "worker-logs-production", "entrypoint": "LogsRPC" }
+  ],
+
+  // Static frontend assets
+  "assets": { "directory": "./public" }
+
+  /**
+   * Secrets (set via `wrangler secret put`):
+   * - MIGRATION_KEY — shared secret for POST /api/internal/migrate endpoints
+   */
+}
