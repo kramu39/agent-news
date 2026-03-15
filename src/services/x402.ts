@@ -50,7 +50,18 @@ export function buildPaymentRequired(opts: PaymentRequiredOpts): Response {
     ],
   };
 
-  const encoded = btoa(JSON.stringify(paymentRequirements));
+  let encoded: string | undefined;
+  try {
+    encoded = btoa(JSON.stringify(paymentRequirements));
+  } catch {
+    // btoa failure is unexpected but non-fatal — the payment-required header
+    // is optional; the 402 body still contains all required payment details
+  }
+
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (encoded) {
+    headers["payment-required"] = encoded;
+  }
 
   return new Response(
     JSON.stringify({
@@ -63,10 +74,7 @@ export function buildPaymentRequired(opts: PaymentRequiredOpts): Response {
     }),
     {
       status: 402,
-      headers: {
-        "Content-Type": "application/json",
-        "payment-required": encoded,
-      },
+      headers,
     }
   );
 }
