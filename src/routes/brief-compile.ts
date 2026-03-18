@@ -1,8 +1,8 @@
 import { Hono } from "hono";
 import type { Env, AppVariables, Source } from "../lib/types";
 import { createRateLimitMiddleware } from "../middleware/rate-limit";
-import { compileBriefData, saveBrief, recordBriefSignals, getConfig } from "../lib/do-client";
-import { CONFIG_PUBLISHER_KEY } from "../lib/constants";
+import { compileBriefData, saveBrief, recordBriefSignals, recordBriefInclusionPayouts, getConfig } from "../lib/do-client";
+import { CONFIG_PUBLISHER_ADDRESS } from "../lib/constants";
 import { resolveAgentNames } from "../services/agent-resolver";
 import { getPacificDate, formatPacificShort } from "../lib/helpers";
 import { validateBtcAddress } from "../lib/validators";
@@ -55,7 +55,7 @@ briefCompileRouter.post("/api/brief/compile", compileRateLimit, async (c) => {
   // Fail closed: if config lookup errors, deny the request rather than skipping the gate
   let publisherConfig: Awaited<ReturnType<typeof getConfig>>;
   try {
-    publisherConfig = await getConfig(c.env, CONFIG_PUBLISHER_KEY);
+    publisherConfig = await getConfig(c.env, CONFIG_PUBLISHER_ADDRESS);
   } catch {
     return c.json({ error: "Unable to verify publisher designation — try again later" }, 503);
   }
@@ -232,6 +232,22 @@ briefCompileRouter.post("/api/brief/compile", compileRateLimit, async (c) => {
     }
   }
 
+  // Record brief-inclusion earnings for all included signals.
+  // Best-effort: awaited but non-fatal — a failure here does not fail the compile request.
+  // Double-pay prevention is enforced by the UNIQUE index on earnings(reason, reference_id).
+  // Guard: skip payouts if brief_signals recording failed — signals haven't transitioned to
+  // brief_included yet, so paying out would be premature. Retry the compile to fix both.
+  let payoutSummary: { paid: number; skipped: number } | undefined;
+  if (signalIds.length > 0 && !briefSignalsWarning) {
+    const payoutResult = await recordBriefInclusionPayouts(c.env, date, signalIds);
+    if (payoutResult.ok && payoutResult.data) {
+      payoutSummary = { paid: payoutResult.data.paid, skipped: payoutResult.data.skipped };
+    } else {
+      const logger = c.get("logger");
+      logger.error("Failed to record brief inclusion payouts", { date, error: payoutResult.error });
+    }
+  }
+
   return c.json(
     {
       ok: true,
@@ -240,6 +256,7 @@ briefCompileRouter.post("/api/brief/compile", compileRateLimit, async (c) => {
       text,
       brief: report,
       ...(briefSignalsWarning && { warning: briefSignalsWarning }),
+      ...(payoutSummary !== undefined && { payouts: payoutSummary }),
     },
     201
   );

@@ -1,4 +1,4 @@
-import type { Env, Beat, Signal, SignalStatus, Source, Brief, Classified, Streak, Earning, Correction, ReferralCredit, BriefSignal, CompiledBriefData, DOResult } from "./types";
+import type { Env, Beat, Signal, SignalStatus, Source, Brief, Classified, Streak, Earning, Correction, ReferralCredit, BriefSignal, CompiledBriefData, DOResult, PayoutRecord, WeeklyPayoutResult } from "./types";
 
 /** Singleton DO stub ID — single instance manages all news data */
 const DO_ID_NAME = "news-singleton";
@@ -586,6 +586,43 @@ export async function creditReferral(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ recruit_address: recruitAddress, signal_id: signalId }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Payouts — brief inclusion and weekly leaderboard prizes
+// ---------------------------------------------------------------------------
+
+export interface BriefInclusionPayoutResult {
+  brief_date: string;
+  paid: number;
+  skipped: number;
+}
+
+/** Record brief-inclusion earnings for a set of signal IDs. Idempotent — already-paid signals are skipped. */
+export async function recordBriefInclusionPayouts(
+  env: Env,
+  briefDate: string,
+  signalIds: string[]
+): Promise<DOResult<BriefInclusionPayoutResult>> {
+  const stub = getStub(env);
+  return doFetch<BriefInclusionPayoutResult>(stub, "/payouts/brief-inclusion", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ brief_date: briefDate, signal_ids: signalIds }),
+  });
+}
+
+/** Record top-3 weekly leaderboard prize earnings for the given ISO week. Idempotent. */
+export async function recordWeeklyPayouts(
+  env: Env,
+  week: string
+): Promise<DOResult<WeeklyPayoutResult>> {
+  const stub = getStub(env);
+  return doFetch<WeeklyPayoutResult>(stub, "/payouts/weekly", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ week }),
   });
 }
 

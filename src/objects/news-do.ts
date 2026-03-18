@@ -1,11 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 import { Hono } from "hono";
 import type { Context } from "hono";
-import type { Env, Beat, Signal, SignalStatus, Streak, Brief, Classified, Earning, Correction, ReferralCredit, BriefSignal, CompiledBriefData, DOResult } from "../lib/types";
+import type { Env, Beat, Signal, SignalStatus, Streak, Brief, Classified, Earning, Correction, ReferralCredit, BriefSignal, CompiledBriefData, DOResult, PayoutRecord } from "../lib/types";
 import { validateSlug, validateHexColor, sanitizeString } from "../lib/validators";
 import { generateId, getPacificDate, getPacificYesterday, getPacificDayStartUTC, getNextDate } from "../lib/helpers";
-import { CLASSIFIED_DURATION_DAYS, SIGNAL_COOLDOWN_HOURS, BEAT_EXPIRY_DAYS, MAX_SIGNALS_PER_DAY, SIGNAL_STATUSES, CONFIG_PUBLISHER_KEY } from "../lib/constants";
-import { SCHEMA_SQL, MIGRATION_PHASE0_SQL, MIGRATION_BEAT_RESTRUCTURE_SQL } from "./schema";
+import { CLASSIFIED_DURATION_DAYS, SIGNAL_COOLDOWN_HOURS, BEAT_EXPIRY_DAYS, MAX_SIGNALS_PER_DAY, SIGNAL_STATUSES, CONFIG_PUBLISHER_ADDRESS, BRIEF_INCLUSION_PAYOUT_SATS, WEEKLY_PRIZE_1ST_SATS, WEEKLY_PRIZE_2ND_SATS, WEEKLY_PRIZE_3RD_SATS } from "../lib/constants";
+import { SCHEMA_SQL, MIGRATION_PHASE0_SQL, MIGRATION_PAYMENTS_SQL, MIGRATION_BEAT_RESTRUCTURE_SQL } from "./schema";
 
 /**
  * Raw SQL row returned by signal SELECT queries.
@@ -110,6 +110,16 @@ export class NewsDO extends DurableObject<Env> {
       console.error("Beat restructure migration failed:", e);
     }
 
+    // Run Phase 4 payments migration — adds UNIQUE index for double-pay prevention.
+    for (const stmt of MIGRATION_PAYMENTS_SQL) {
+      try {
+        this.ctx.storage.sql.exec(stmt);
+      } catch (e) {
+        // Index already exists — safe to ignore on re-run.
+        console.error("Payments migration statement failed (likely already applied):", e);
+      }
+    }
+
     // Internal Hono router for DO-internal routing
     this.router = new Hono();
 
@@ -168,7 +178,7 @@ export class NewsDO extends DurableObject<Env> {
 
       // Verify publisher designation
       const publisherRows = this.ctx.storage.sql
-        .exec("SELECT value FROM config WHERE key = ?", CONFIG_PUBLISHER_KEY)
+        .exec("SELECT value FROM config WHERE key = ?", CONFIG_PUBLISHER_ADDRESS)
         .toArray();
       if (publisherRows.length === 0) {
         return c.json({ ok: false, error: "Publisher not yet designated" } satisfies DOResult<Signal>, 403);
@@ -1494,6 +1504,152 @@ export class NewsDO extends DurableObject<Env> {
     });
 
     // -------------------------------------------------------------------------
+    // Payouts — record earnings for brief inclusion and weekly leaderboard prizes
+    // -------------------------------------------------------------------------
+
+    // POST /payouts/brief-inclusion — record a payout for each signal in a brief
+    // Idempotent: INSERT OR IGNORE skips duplicate (reason, reference_id) pairs.
+    this.router.post("/payouts/brief-inclusion", async (c) => {
+      const body = await parseRequiredJson(c);
+      if (!body) {
+        return c.json({ ok: false, error: "Invalid JSON body" } satisfies DOResult<unknown>, 400);
+      }
+
+      const { brief_date, signal_ids } = body;
+      if (!brief_date || typeof brief_date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(brief_date as string)) {
+        return c.json(
+          { ok: false, error: "Missing or invalid field: brief_date (expected YYYY-MM-DD format)" } satisfies DOResult<unknown>,
+          400
+        );
+      }
+      if (!Array.isArray(signal_ids) || signal_ids.length === 0) {
+        return c.json(
+          { ok: false, error: "Missing required field: signal_ids (non-empty array)" } satisfies DOResult<unknown>,
+          400
+        );
+      }
+
+      // Validate and deduplicate signal IDs
+      const validIds = [...new Set((signal_ids as unknown[]).filter((id): id is string => typeof id === "string" && id.length > 0))];
+      if (validIds.length === 0) {
+        return c.json(
+          { ok: false, error: "signal_ids must contain at least one non-empty string" } satisfies DOResult<unknown>,
+          400
+        );
+      }
+
+      const now = new Date().toISOString();
+      let paid = 0;
+      let skipped = 0;
+
+      for (const signalId of validIds) {
+        // Look up correspondent for this signal
+        const sigRows = this.ctx.storage.sql
+          .exec("SELECT btc_address FROM signals WHERE id = ?", signalId)
+          .toArray();
+        if (sigRows.length === 0) continue;
+
+        const btcAddress = (sigRows[0] as Record<string, unknown>).btc_address as string;
+
+        // Single INSERT OR IGNORE — the UNIQUE index handles dedup, rowsWritten tells us the outcome
+        const cursor = this.ctx.storage.sql.exec(
+          `INSERT OR IGNORE INTO earnings (id, btc_address, amount_sats, reason, reference_id, created_at)
+           VALUES (?, ?, ?, 'brief_inclusion', ?, ?)`,
+          generateId(),
+          btcAddress,
+          BRIEF_INCLUSION_PAYOUT_SATS,
+          signalId,
+          now
+        );
+        if (cursor.rowsWritten > 0) paid++; else skipped++;
+      }
+
+      return c.json(
+        { ok: true, data: { brief_date: brief_date as string, paid, skipped } } satisfies DOResult<unknown>,
+        201
+      );
+    });
+
+    // POST /payouts/weekly — record top-3 leaderboard prize earnings for a given week
+    // week format: YYYY-WNN (e.g. "2026-W11")
+    // Idempotent: INSERT OR IGNORE skips duplicate (reason, reference_id) pairs.
+    this.router.post("/payouts/weekly", async (c) => {
+      const body = await parseRequiredJson(c);
+      if (!body) {
+        return c.json({ ok: false, error: "Invalid JSON body" } satisfies DOResult<unknown>, 400);
+      }
+
+      const { week } = body;
+      if (!week || typeof week !== "string" || !/^\d{4}-W\d{2}$/.test(week as string)) {
+        return c.json(
+          { ok: false, error: "Missing or invalid field: week (expected YYYY-WNN format, e.g. '2026-W11')" } satisfies DOResult<unknown>,
+          400
+        );
+      }
+
+      // Validate ISO week number is in valid range (01-53)
+      const weekNum = parseInt((week as string).slice(-2), 10);
+      if (weekNum < 1 || weekNum > 53) {
+        return c.json(
+          { ok: false, error: "Invalid ISO week number — must be between 01 and 53" } satisfies DOResult<unknown>,
+          400
+        );
+      }
+
+      const top3 = this.queryLeaderboard(3) as Array<{ btc_address: string; score: number }>;
+
+      if (top3.length === 0) {
+        return c.json(
+          { ok: false, error: "No leaderboard data — no signals have been filed yet" } satisfies DOResult<unknown>,
+          400
+        );
+      }
+
+      const prizes = [
+        { rank: 1, reason: "weekly_prize_1st", amount_sats: WEEKLY_PRIZE_1ST_SATS },
+        { rank: 2, reason: "weekly_prize_2nd", amount_sats: WEEKLY_PRIZE_2ND_SATS },
+        { rank: 3, reason: "weekly_prize_3rd", amount_sats: WEEKLY_PRIZE_3RD_SATS },
+      ];
+
+      const now = new Date().toISOString();
+      const weekStr = week as string;
+
+      const paid: PayoutRecord[] = [];
+      const skipped: PayoutRecord[] = [];
+
+      for (let i = 0; i < top3.length; i++) {
+        const entry = top3[i];
+        const prize = prizes[i];
+        if (!entry || !prize) continue;
+
+        const record: PayoutRecord = {
+          rank: prize.rank,
+          btc_address: entry.btc_address,
+          amount_sats: prize.amount_sats,
+          reason: prize.reason,
+        };
+
+        // Single INSERT OR IGNORE — the UNIQUE index handles dedup, rowsWritten tells us the outcome
+        const cursor = this.ctx.storage.sql.exec(
+          `INSERT OR IGNORE INTO earnings (id, btc_address, amount_sats, reason, reference_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          generateId(),
+          entry.btc_address,
+          prize.amount_sats,
+          prize.reason,
+          weekStr,
+          now
+        );
+        if (cursor.rowsWritten > 0) paid.push(record); else skipped.push(record);
+      }
+
+      return c.json(
+        { ok: true, data: { week: weekStr, paid, skipped, warnings: [] } } satisfies DOResult<unknown>,
+        201
+      );
+    });
+
+    // -------------------------------------------------------------------------
     // Brief Signals — track which signals are included in each brief
     // -------------------------------------------------------------------------
 
@@ -1661,7 +1817,7 @@ export class NewsDO extends DurableObject<Env> {
 
       // Verify publisher
       const publisherRows = this.ctx.storage.sql
-        .exec("SELECT value FROM config WHERE key = ?", CONFIG_PUBLISHER_KEY)
+        .exec("SELECT value FROM config WHERE key = ?", CONFIG_PUBLISHER_ADDRESS)
         .toArray();
       if (publisherRows.length === 0) {
         return c.json({ ok: false, error: "Publisher not yet designated" } satisfies DOResult<Correction>, 403);
@@ -1820,60 +1976,65 @@ export class NewsDO extends DurableObject<Env> {
 
     // GET /leaderboard — weighted scores across all roles
     this.router.get("/leaderboard", (c) => {
-      // Single query joining all scoring sources with 30-day rolling windows
-      const rows = this.ctx.storage.sql
-        .exec(
-          `SELECT
-             a.btc_address,
-             COALESCE(bi.inclusion_count, 0) as brief_inclusions_30d,
-             COALESCE(sc.signal_count, 0) as signal_count_30d,
-             COALESCE(st.current_streak, 0) as current_streak,
-             COALESCE(da.days_active, 0) as days_active_30d,
-             COALESCE(cr.correction_count, 0) as approved_corrections_30d,
-             COALESCE(rf.referral_count, 0) as referral_credits_30d,
-             (COALESCE(bi.inclusion_count, 0) * 20
-              + COALESCE(sc.signal_count, 0) * 5
-              + COALESCE(st.current_streak, 0) * 5
-              + COALESCE(da.days_active, 0) * 2
-              + COALESCE(cr.correction_count, 0) * 15
-              + COALESCE(rf.referral_count, 0) * 25) as score
-           FROM (SELECT DISTINCT btc_address FROM signals WHERE correction_of IS NULL) a
-           LEFT JOIN (
-             SELECT btc_address, COUNT(*) as inclusion_count
-             FROM brief_signals WHERE created_at > datetime('now', '-30 days')
-             GROUP BY btc_address
-           ) bi ON a.btc_address = bi.btc_address
-           LEFT JOIN (
-             SELECT btc_address, COUNT(*) as signal_count
-             FROM signals WHERE correction_of IS NULL AND created_at > datetime('now', '-30 days')
-             GROUP BY btc_address
-           ) sc ON a.btc_address = sc.btc_address
-           LEFT JOIN streaks st ON a.btc_address = st.btc_address
-           LEFT JOIN (
-             SELECT btc_address, COUNT(DISTINCT date(created_at)) as days_active
-             FROM signals WHERE correction_of IS NULL AND created_at > datetime('now', '-30 days')
-             GROUP BY btc_address
-           ) da ON a.btc_address = da.btc_address
-           LEFT JOIN (
-             SELECT btc_address, COUNT(*) as correction_count
-             FROM corrections WHERE status = 'approved' AND created_at > datetime('now', '-30 days')
-             GROUP BY btc_address
-           ) cr ON a.btc_address = cr.btc_address
-           LEFT JOIN (
-             SELECT scout_address as btc_address, COUNT(*) as referral_count
-             FROM referral_credits WHERE credited_at IS NOT NULL AND credited_at > datetime('now', '-30 days')
-             GROUP BY scout_address
-           ) rf ON a.btc_address = rf.btc_address
-           ORDER BY score DESC
-           LIMIT 200`
-        )
-        .toArray();
+      const rows = this.queryLeaderboard(200);
       return c.json({ ok: true, data: rows } satisfies DOResult<unknown[]>);
     });
 
     this.router.all("*", (c) => {
       return c.json({ ok: false, error: "Not found" }, 404);
     });
+  }
+
+  /** Shared leaderboard scoring query — used by GET /leaderboard and POST /payouts/weekly. */
+  private queryLeaderboard(limit: number): Array<Record<string, unknown>> {
+    return this.ctx.storage.sql
+      .exec(
+        `SELECT
+           a.btc_address,
+           COALESCE(bi.inclusion_count, 0) as brief_inclusions_30d,
+           COALESCE(sc.signal_count, 0) as signal_count_30d,
+           COALESCE(st.current_streak, 0) as current_streak,
+           COALESCE(da.days_active, 0) as days_active_30d,
+           COALESCE(cr.correction_count, 0) as approved_corrections_30d,
+           COALESCE(rf.referral_count, 0) as referral_credits_30d,
+           (COALESCE(bi.inclusion_count, 0) * 20
+            + COALESCE(sc.signal_count, 0) * 5
+            + COALESCE(st.current_streak, 0) * 5
+            + COALESCE(da.days_active, 0) * 2
+            + COALESCE(cr.correction_count, 0) * 15
+            + COALESCE(rf.referral_count, 0) * 25) as score
+         FROM (SELECT DISTINCT btc_address FROM signals WHERE correction_of IS NULL) a
+         LEFT JOIN (
+           SELECT btc_address, COUNT(*) as inclusion_count
+           FROM brief_signals WHERE created_at > datetime('now', '-30 days')
+           GROUP BY btc_address
+         ) bi ON a.btc_address = bi.btc_address
+         LEFT JOIN (
+           SELECT btc_address, COUNT(*) as signal_count
+           FROM signals WHERE correction_of IS NULL AND created_at > datetime('now', '-30 days')
+           GROUP BY btc_address
+         ) sc ON a.btc_address = sc.btc_address
+         LEFT JOIN streaks st ON a.btc_address = st.btc_address
+         LEFT JOIN (
+           SELECT btc_address, COUNT(DISTINCT date(created_at)) as days_active
+           FROM signals WHERE correction_of IS NULL AND created_at > datetime('now', '-30 days')
+           GROUP BY btc_address
+         ) da ON a.btc_address = da.btc_address
+         LEFT JOIN (
+           SELECT btc_address, COUNT(*) as correction_count
+           FROM corrections WHERE status = 'approved' AND created_at > datetime('now', '-30 days')
+           GROUP BY btc_address
+         ) cr ON a.btc_address = cr.btc_address
+         LEFT JOIN (
+           SELECT scout_address as btc_address, COUNT(*) as referral_count
+           FROM referral_credits WHERE credited_at IS NOT NULL AND credited_at > datetime('now', '-30 days')
+           GROUP BY scout_address
+         ) rf ON a.btc_address = rf.btc_address
+         ORDER BY score DESC, a.btc_address ASC
+         LIMIT ?`,
+        limit
+      )
+      .toArray();
   }
 
   async fetch(request: Request): Promise<Response> {
