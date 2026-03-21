@@ -1494,6 +1494,7 @@
       line-height: 1.7;
       color: var(--text);
       margin-bottom: var(--space-3);
+      overflow-wrap: anywhere;
     }
     .signal-modal .brief-text-headline,
     .signal-modal .column-headline,
@@ -1609,8 +1610,40 @@
       border-color: var(--text);
     }
 
+    /* ═══ Pending Review Banner ═══ */
+    .pending-review-banner {
+      background: rgba(255, 193, 7, 0.12);
+      border-left: 4px solid #ffc107;
+      border-radius: 4px;
+      padding: 10px 16px;
+      margin-bottom: 16px;
+    }
+
+    .pending-review-banner .pending-review-subtitle {
+      color: var(--text-muted, #888);
+      font-size: 0.9em;
+      margin-left: 8px;
+    }
+
+    /* Word-break for long hashes/URLs in signal content */
+    .lead-content,
+    .story-content,
+    .brief-text-content,
+    .column-content {
+      overflow-wrap: anywhere;
+    }
+
     /* ═══ Tablet (768px) ═══ */
     @media (max-width: 768px) {
+      .pending-review-banner {
+        /* Break out of .page padding so banner spans full width */
+        margin-left: calc(-1 * var(--page-padding));
+        margin-right: calc(-1 * var(--page-padding));
+        border-radius: 0;
+        padding-left: var(--page-padding);
+        padding-right: var(--page-padding);
+      }
+
       .mosaic {
         grid-template-columns: 1fr;
       }
@@ -2939,9 +2972,9 @@
 
         // Render submitted signals with a pending-review banner
         const pendingBanner = `
-          <div class="pending-review-banner fade-in" style="background:rgba(255,193,7,0.12);border-left:4px solid #ffc107;padding:10px 16px;margin-bottom:16px;border-radius:4px;">
+          <div class="pending-review-banner fade-in">
             <strong>&#x23F3; Pending Editorial Review</strong>
-            <span style="color:var(--text-muted,#888);font-size:0.9em;margin-left:8px;">These signals have been submitted and are awaiting curation. Curated signals will appear here once reviewed.</span>
+            <span class="pending-review-subtitle">These signals have been submitted and are awaiting curation. Curated signals will appear here once reviewed.</span>
           </div>`;
 
         const agents = new Set(submittedSignals.map(s => s.btcAddress));
