@@ -89,12 +89,6 @@ export interface FrontPagePageResult {
   hasMore: boolean;
 }
 
-export async function getSignalCounts(env: Env): Promise<Record<string, number>> {
-  const stub = getStub(env);
-  const result = await doFetch<Record<string, number>>(stub, "/signals/counts");
-  if (!result.ok) throw new Error(result.error ?? "Failed to get signal counts");
-  return result.data ?? {};
-}
 
 export async function listSignals(
   env: Env,
@@ -219,6 +213,37 @@ export interface CorrectionInput {
   sources?: Source[];
   tags?: string[];
   signature?: string;
+}
+
+export interface SignalCountsFilters {
+  beat?: string;
+  agent?: string;
+  since?: string;
+}
+
+export interface SignalCounts {
+  submitted: number;
+  in_review: number;
+  approved: number;
+  rejected: number;
+  brief_included: number;
+  total: number;
+}
+
+export async function getSignalCounts(
+  env: Env,
+  filters: SignalCountsFilters = {}
+): Promise<SignalCounts> {
+  const stub = getStub(env);
+  const params = new URLSearchParams();
+  if (filters.beat) params.set("beat", filters.beat);
+  if (filters.agent) params.set("agent", filters.agent);
+  if (filters.since) params.set("since", filters.since);
+  const qs = params.toString();
+  const result = await doFetch<SignalCounts>(stub, `/signals/counts${qs ? `?${qs}` : ""}`);
+  if (!result.ok) throw new Error(result.error ?? "Failed to get signal counts");
+  if (result.data === undefined) throw new Error("Missing data in response");
+  return result.data;
 }
 
 export async function correctSignal(
