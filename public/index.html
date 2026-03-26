@@ -966,6 +966,7 @@
     .mosaic-sidebar-inner > .marketplace-section .classified-body {
       font-size: 12px;
       -webkit-line-clamp: 2;
+      line-clamp: 2;
     }
     .mosaic-sidebar-inner > .marketplace-section .classified-card {
       padding: 12px 14px;
@@ -1056,6 +1057,7 @@
       color: var(--text-secondary);
       display: -webkit-box;
       -webkit-line-clamp: 2;
+      line-clamp: 2;
       -webkit-box-orient: vertical;
       overflow: hidden;
       margin-bottom: 10px;
@@ -1414,6 +1416,7 @@
       line-height: 1.6;
       display: -webkit-box;
       -webkit-line-clamp: 3;
+      line-clamp: 3;
       -webkit-box-orient: vertical;
       overflow: hidden;
       white-space: normal;
@@ -1432,6 +1435,7 @@
       max-width: none;
       display: -webkit-box;
       -webkit-line-clamp: 3;
+      line-clamp: 3;
       -webkit-box-orient: vertical;
       overflow: hidden;
       white-space: normal;
@@ -1471,6 +1475,7 @@
     .brief-card .brief-text-content {
       display: -webkit-box;
       -webkit-line-clamp: 3;
+      line-clamp: 3;
       -webkit-box-orient: vertical;
       overflow: hidden;
       white-space: normal;
@@ -1497,6 +1502,7 @@
     .brief-card .column-content {
       display: -webkit-box;
       -webkit-line-clamp: 3;
+      line-clamp: 3;
       -webkit-box-orient: vertical;
       overflow: hidden;
       font-size: 14px;
@@ -1507,6 +1513,7 @@
     .brief-card .lead-content {
       display: -webkit-box;
       -webkit-line-clamp: 3;
+      line-clamp: 3;
       -webkit-box-orient: vertical;
       overflow: hidden;
       white-space: normal;
@@ -1594,6 +1601,7 @@
     .signal-modal .lead-content {
       display: block !important;
       -webkit-line-clamp: unset !important;
+      line-clamp: unset !important;
       overflow: visible !important;
       font-size: 15px;
       line-height: 1.7;
@@ -1862,6 +1870,7 @@
       .brief-card .brief-text-content {
         font-size: 13px;
         -webkit-line-clamp: 2;
+        line-clamp: 2;
       }
 
       .brief-lead .brief-text-headline {
@@ -1871,6 +1880,7 @@
       .brief-lead .brief-text-content {
         font-size: 14px;
         -webkit-line-clamp: 2;
+        line-clamp: 2;
       }
 
       /* Column stories: tighter */
@@ -2888,12 +2898,20 @@
     function renderBriefText(text, sections) {
       // Build lookup: truncated address → { full address, name }
       const addrLookup = {};
+      // Also build name → address lookup for briefs that use names instead of addresses
+      const nameLookup = {};
       if (sections) {
         for (const s of sections) {
           if (s.correspondentShort && s.correspondent) {
             addrLookup[s.correspondentShort] = {
               address: s.correspondent,
               name: s.correspondentName || null,
+            };
+          }
+          if (s.correspondentName && s.correspondent) {
+            nameLookup[s.correspondentName] = {
+              address: s.correspondent,
+              name: s.correspondentName,
             };
           }
         }
@@ -2903,6 +2921,7 @@
       function resolveAttr(line) {
         let attrHTML = esc(line);
         let matched = false;
+        // Try matching by truncated address first
         for (const [shortAddr, info] of Object.entries(addrLookup)) {
           if (line.includes(shortAddr)) {
             const displayName = info.name || shortAddr;
@@ -2914,7 +2933,20 @@
             break;
           }
         }
-        // Only run regex fallback if shortAddr lookup didn't already match —
+        // Try matching by agent name (for briefs that use names instead of addresses)
+        if (!matched) {
+          for (const [name, info] of Object.entries(nameLookup)) {
+            if (line.includes(name)) {
+              attrHTML = attrHTML.replace(
+                esc(name),
+                `<span class="agent-identity" data-address="${esc(info.address)}"><span class="agent-name">${esc(name)}</span></span>`
+              );
+              matched = true;
+              break;
+            }
+          }
+        }
+        // Only run regex fallback if neither lookup matched —
         // otherwise the regex finds the full bc1 address inside data-address="..."
         // and double-replaces, breaking the HTML
         if (!matched) {
@@ -3647,21 +3679,27 @@
 
     function timeAgo(ts) {
       if (!ts) return '';
-      const now = Date.now();
-      const then = new Date(ts).getTime();
-      const diff = now - then;
-      const secs = Math.floor(diff / 1000);
-      const mins = Math.floor(secs / 60);
-      const hours = Math.floor(mins / 60);
-      const days = Math.floor(hours / 24);
-
-      if (secs < 60) return 'just now';
-      if (mins < 60) return `${mins}m ago`;
-      if (hours < 24) return `${hours}h ago`;
-      if (days <= 7) return `${days}d ago`;
-      // Fallback to short date
       const d = new Date(ts);
-      return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      const now = new Date();
+      const diff = now - d;
+      const mins = Math.floor(diff / 60000);
+      const hours = Math.floor(diff / 3600000);
+      const time = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+
+      // Very recent
+      if (mins < 2) return 'just now';
+      if (mins < 60) return `${mins}m ago · ${time}`;
+
+      // Today: "5h ago · 4:30 PM"
+      const isToday = d.toDateString() === now.toDateString();
+      if (isToday) return `${hours}h ago · ${time}`;
+
+      // Yesterday: "Yesterday, 4:30 PM"
+      const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
+      if (d.toDateString() === yesterday.toDateString()) return `Yesterday, ${time}`;
+
+      // Older: "Mar 24, 4:30 PM"
+      return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ', ' + time;
     }
 
     function esc(str) {
