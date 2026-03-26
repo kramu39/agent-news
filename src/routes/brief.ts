@@ -4,7 +4,7 @@ import { getLatestBrief, getBriefByDate, listBriefDates, recordEarning } from ".
 import { BRIEF_PRICE_SATS, CORRESPONDENT_SHARE } from "../lib/constants";
 import { getPacificDate } from "../lib/helpers";
 import { validateDateFormat } from "../lib/validators";
-import { buildPaymentRequired, verifyPayment } from "../services/x402";
+import { buildPaymentRequired, verifyPayment, mapVerificationError } from "../services/x402";
 
 const briefRouter = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
@@ -106,16 +106,8 @@ briefRouter.get("/api/brief/:date", async (c) => {
 
     const verification = await verifyPayment(paymentHeader, BRIEF_PRICE_SATS, c.env);
     if (!verification.valid) {
-      if (verification.relayError) {
-        return c.json(
-          { error: "Payment relay unavailable. Your payment was not consumed — please retry shortly." },
-          503
-        );
-      }
-      const reason = verification.relayReason
-        ? ` Relay: ${verification.relayReason}`
-        : "";
-      return c.json({ error: `Payment verification failed.${reason}` }, 402);
+      const [body, status] = mapVerificationError(verification);
+      return c.json(body, status);
     }
 
     // Record earnings split: correspondent share + treasury remainder
