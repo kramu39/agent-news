@@ -511,6 +511,48 @@ export class NewsDO extends DurableObject<Env> {
       return c.json({ ok: true, data: beats } satisfies DOResult<Beat[]>);
     });
 
+    // GET /beats/membership — query beats joined by a specific agent
+    this.router.get("/beats/membership", (c) => {
+      const btcAddress = c.req.query("btc_address");
+      if (!btcAddress) {
+        return c.json(
+          { ok: false, error: "Missing required param: btc_address" } satisfies DOResult<unknown>,
+          400
+        );
+      }
+
+      // Single JOIN: all beats with membership info for this agent
+      const rows = this.ctx.storage.sql
+        .exec(
+          `SELECT b.slug, bc.claimed_at, bc.status
+           FROM beats b
+           LEFT JOIN beat_claims bc
+             ON bc.beat_slug = b.slug
+            AND bc.btc_address = ?
+            AND bc.status = 'active'
+           ORDER BY b.slug`,
+          btcAddress
+        )
+        .toArray();
+
+      const beats: Array<{ slug: string; joined_at: string; status: "active" }> = [];
+      const availableBeats: string[] = [];
+
+      for (const r of rows) {
+        const row = r as Record<string, unknown>;
+        if (row.claimed_at) {
+          beats.push({ slug: row.slug as string, joined_at: row.claimed_at as string, status: "active" });
+        } else {
+          availableBeats.push(row.slug as string);
+        }
+      }
+
+      return c.json({
+        ok: true,
+        data: { agent: btcAddress, beats, available_beats: availableBeats },
+      } satisfies DOResult<{ agent: string; beats: Array<{ slug: string; joined_at: string; status: "active" }>; available_beats: string[] }>);
+    });
+
     // GET /beats/:slug — get a single beat by slug, with computed status
     this.router.get("/beats/:slug", (c) => {
       const slug = c.req.param("slug");
