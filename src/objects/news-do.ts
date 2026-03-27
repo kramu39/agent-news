@@ -3,7 +3,7 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import type { Env, Beat, Signal, SignalStatus, Streak, Brief, Classified, ClassifiedStatus, Earning, Correction, ReferralCredit, BriefSignal, CompiledBriefData, DOResult, PayoutRecord } from "../lib/types";
 import { validateSlug, validateHexColor, sanitizeString, validateDateFormat } from "../lib/validators";
-import { generateId, getPacificDate, getPacificYesterday, getPacificDayStartUTC, getNextDate } from "../lib/helpers";
+import { generateId, getPacificDate, getPacificYesterday, getPacificDayStartUTC, getPacificDayEndUTC, getNextDate } from "../lib/helpers";
 import { CLASSIFIED_DURATION_DAYS, CLASSIFIED_BRIEF_SLOTS, CLASSIFIED_BRIEF_MAX_CHARS, CLASSIFIED_STATUSES, SIGNAL_COOLDOWN_HOURS, BEAT_EXPIRY_DAYS, MAX_SIGNALS_PER_DAY, SIGNAL_STATUSES, CONFIG_PUBLISHER_ADDRESS, BRIEF_INCLUSION_PAYOUT_SATS, WEEKLY_PRIZE_1ST_SATS, WEEKLY_PRIZE_2ND_SATS, WEEKLY_PRIZE_3RD_SATS, SCORING_WEIGHTS } from "../lib/constants";
 import { SCHEMA_SQL, MIGRATION_PHASE0_SQL, MIGRATION_PAYMENTS_SQL, MIGRATION_BEAT_RESTRUCTURE_SQL, MIGRATION_SBTC_TRACKING_SQL, MIGRATION_CLASSIFIEDS_CLEANUP_SQL, MIGRATION_CLASSIFIEDS_REVIEW_SQL, MIGRATION_SNAPSHOTS_SQL, MIGRATION_BEAT_CLAIMS_SQL, MIGRATION_RETRACTION_SQL } from "./schema";
 
@@ -957,11 +957,22 @@ export class NewsDO extends DurableObject<Env> {
       const since = c.req.query("since") ?? null;
       const tag = c.req.query("tag") ?? null;
       const status = c.req.query("status") ?? null;
+      const dateParam = c.req.query("date") ?? null;
       const limitParam = c.req.query("limit");
       const limit = Math.min(
         Math.max(1, parseInt(limitParam ?? "50", 10) || 50),
         200
       );
+      const offset = Math.min(Math.max(0, parseInt(c.req.query("offset") ?? "0", 10) || 0), 10_000);
+
+      // When `date` is provided (YYYY-MM-DD), convert to Pacific day UTC boundaries.
+      // `date` and `since` are mutually exclusive — `date` takes precedence.
+      let dateStart: string | null = null;
+      let dateEnd: string | null = null;
+      if (dateParam) {
+        dateStart = getPacificDayStartUTC(dateParam);
+        dateEnd = getPacificDayEndUTC(dateParam);
+      }
 
       const rows = this.ctx.storage.sql
         .exec(
@@ -974,15 +985,21 @@ export class NewsDO extends DurableObject<Env> {
              AND (?3 IS NULL OR s.created_at > ?3)
              AND (?4 IS NULL OR s.id IN (SELECT signal_id FROM signal_tags WHERE tag = ?4))
              AND (?5 IS NULL OR s.status = ?5)
+             AND (?7 IS NULL OR s.created_at >= ?7)
+             AND (?8 IS NULL OR s.created_at < ?8)
            GROUP BY s.id
            ORDER BY s.created_at DESC
-           LIMIT ?6`,
+           LIMIT ?6
+           OFFSET ?9`,
           beat,
           agent,
-          since,
+          dateParam ? null : since,
           tag,
           status,
-          limit
+          limit,
+          dateStart,
+          dateEnd,
+          offset
         )
         .toArray();
 
