@@ -23,6 +23,7 @@ import {
   getClassifiedsRotation,
 } from "../lib/do-client";
 import { buildPaymentRequired, verifyPayment, mapVerificationError } from "../services/x402";
+import { resolveNamesWithTimeout } from "../lib/helpers";
 
 /** Transform a Classified row to the camelCase API response shape. */
 export function transformClassified(cl: Classified) {
@@ -79,8 +80,25 @@ classifiedsRouter.get("/api/classifieds", async (c) => {
 
   const transformed = classifieds.map(transformClassified);
 
+  // Resolve agent display names
+  const clAddresses = [...new Set(transformed.map((cl) => cl.placedBy).filter(Boolean))];
+  const clNameMap = await resolveNamesWithTimeout(
+    c.env.NEWS_KV,
+    clAddresses,
+    (p) => c.executionCtx.waitUntil(p)
+  );
+  const withNames = transformed.map((cl) => {
+    const info = clNameMap.get(cl.placedBy);
+    const avatarAddr = info?.btcAddress ?? cl.placedBy;
+    return {
+      ...cl,
+      displayName: info?.name ?? null,
+      avatar: `https://bitcoinfaces.xyz/api/get-image?name=${encodeURIComponent(avatarAddr)}`,
+    };
+  });
+
   c.header("Cache-Control", "public, max-age=60, s-maxage=300");
-  return c.json({ classifieds: transformed, total: transformed.length });
+  return c.json({ classifieds: withNames, total: withNames.length });
 });
 
 // GET /api/classifieds/:id — get a single classified ad
@@ -90,8 +108,20 @@ classifiedsRouter.get("/api/classifieds/:id", async (c) => {
   if (!cl) {
     return c.json({ error: `Classified "${id}" not found` }, 404);
   }
+  const clData = transformClassified(cl);
+  const singleNameMap = await resolveNamesWithTimeout(
+    c.env.NEWS_KV,
+    [clData.placedBy].filter(Boolean),
+    (p) => c.executionCtx.waitUntil(p)
+  );
+  const clInfo = singleNameMap.get(clData.placedBy);
+  const clAvatarAddr = clInfo?.btcAddress ?? clData.placedBy;
   c.header("Cache-Control", "public, max-age=60, s-maxage=300");
-  return c.json(transformClassified(cl));
+  return c.json({
+    ...clData,
+    displayName: clInfo?.name ?? null,
+    avatar: `https://bitcoinfaces.xyz/api/get-image?name=${encodeURIComponent(clAvatarAddr)}`,
+  });
 });
 
 // POST /api/classifieds — place a classified ad (x402 payment required)
