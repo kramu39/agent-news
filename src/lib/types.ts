@@ -134,6 +134,10 @@ export interface Beat {
   readonly created_by: string;
   readonly created_at: string;
   readonly updated_at: string;
+  /** Per-beat daily approval cap (null = unlimited). Added in MIGRATION_BITCOIN_MACRO_SQL. */
+  readonly daily_approved_limit?: number | null;
+  /** Per-review payment rate for the beat editor in satoshis (null = not configured). Added in migration 19. */
+  readonly editor_review_rate_sats?: number | null;
   /** Computed on read — not stored in DB */
   readonly status?: "active" | "inactive";
   /** Active members from beat_claims — populated when joined */
@@ -284,6 +288,19 @@ export interface IncludedSignalMetadata {
   readonly beat_slug: string;
   readonly headline: string | null;
   readonly created_at: string;
+}
+
+/**
+ * A beat editor registration record.
+ * Publishers register editors for specific beats; editors can approve/reject signals on their beat.
+ */
+export interface BeatEditor {
+  readonly beat_slug: string;
+  readonly btc_address: string;
+  readonly status: "active" | "inactive";
+  readonly registered_at: string;
+  readonly registered_by: string;
+  readonly deactivated_at: string | null;
 }
 
 /**

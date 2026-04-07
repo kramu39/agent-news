@@ -97,7 +97,6 @@ export const CORRESPONDENT_SHARE = 0.7;
 // ── Signal statuses (editorial pipeline) ──
 export const SIGNAL_STATUSES = [
   "submitted",
-  "in_review",
   "approved",
   "replaced",
   "rejected",
@@ -106,7 +105,6 @@ export const SIGNAL_STATUSES = [
 
 export const REVIEWABLE_SIGNAL_STATUSES = [
   "submitted",
-  "in_review",
   "approved",
   "replaced",
   "rejected",

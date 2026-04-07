@@ -1,4 +1,4 @@
-import type { Env, Beat, Signal, SignalStatus, Source, Brief, Classified, ClassifiedStatus, Streak, Earning, Correction, ReferralCredit, BriefSignal, CompiledBriefData, DOResult, DOErrorStatus, WeeklyPayoutResult, PaymentStageMaterialized, PaymentStagePayload, PaymentTrackedState, PaymentTerminalReason } from "./types";
+import type { Env, Beat, Signal, SignalStatus, Source, Brief, Classified, ClassifiedStatus, Streak, Earning, Correction, ReferralCredit, BriefSignal, CompiledBriefData, DOResult, DOErrorStatus, WeeklyPayoutResult, PaymentStageMaterialized, PaymentStagePayload, PaymentTrackedState, PaymentTerminalReason, BeatEditor } from "./types";
 import { CLASSIFIED_BRIEF_SLOTS } from "./constants";
 
 /** Singleton DO stub ID — single instance manages all news data */
@@ -289,7 +289,6 @@ export interface SignalCountsFilters {
 
 export interface SignalCounts {
   submitted: number;
-  in_review: number;
   approved: number;
   replaced: number;
   rejected: number;
@@ -834,9 +833,15 @@ export async function getBriefSignals(env: Env, date: string): Promise<unknown[]
 export interface CreateCorrectionInput {
   signal_id: string;
   btc_address: string;
-  claim: string;
-  correction: string;
+  claim?: string;
+  correction?: string;
   sources?: string | null;
+  type?: "correction" | "editorial_review";
+  score?: number;
+  factcheck_passed?: boolean;
+  beat_relevance?: number;
+  recommendation?: string;
+  feedback?: string;
 }
 
 export async function createCorrection(
@@ -1070,5 +1075,106 @@ export async function resetLeaderboard(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ btc_address: publisherAddress }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Beat Editors (publisher-managed editorial delegation)
+// ---------------------------------------------------------------------------
+
+export interface RegisterBeatEditorInput {
+  btc_address: string;
+  registered_by: string;
+}
+
+export interface BeatEditorsData {
+  beat_slug: string;
+  editors: BeatEditor[];
+}
+
+export interface EditorBeatsData {
+  btc_address: string;
+  beats: BeatEditor[];
+}
+
+/** Register (or reactivate) an editor for a beat. Publisher-only. */
+export async function registerBeatEditor(
+  env: Env,
+  beatSlug: string,
+  input: RegisterBeatEditorInput
+): Promise<DOResult<BeatEditor>> {
+  const stub = getStub(env);
+  return doFetch<BeatEditor>(stub, "/beat-editors", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...input, beat_slug: beatSlug }),
+  });
+}
+
+/** Deactivate an editor from a beat. Publisher-only. */
+export async function deactivateBeatEditor(
+  env: Env,
+  beatSlug: string,
+  address: string,
+  publisherAddress: string
+): Promise<DOResult<{ deactivated: boolean; beat_slug: string; btc_address: string }>> {
+  const stub = getStub(env);
+  return doFetch<{ deactivated: boolean; beat_slug: string; btc_address: string }>(
+    stub,
+    `/beat-editors/${encodeURIComponent(beatSlug)}/${encodeURIComponent(address)}`,
+    {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ registered_by: publisherAddress }),
+    }
+  );
+}
+
+/** List active editors for a beat. Public. */
+export async function listBeatEditors(
+  env: Env,
+  beatSlug: string
+): Promise<DOResult<BeatEditorsData>> {
+  const stub = getStub(env);
+  return doFetch<BeatEditorsData>(stub, `/beat-editors/${encodeURIComponent(beatSlug)}`);
+}
+
+/** List all beats an editor is assigned to. Public. */
+export async function listEditorBeats(
+  env: Env,
+  address: string
+): Promise<DOResult<EditorBeatsData>> {
+  const stub = getStub(env);
+  return doFetch<EditorBeatsData>(stub, `/editors/${encodeURIComponent(address)}`);
+}
+
+// ---------------------------------------------------------------------------
+// Editor Earnings (system-created at compile time)
+// ---------------------------------------------------------------------------
+
+/** List editor earnings. Caller must be the editor or publisher. */
+export async function listEditorEarnings(
+  env: Env,
+  editorAddress: string,
+  callerAddress: string
+): Promise<DOResult<Earning[]>> {
+  const stub = getStub(env);
+  const params = new URLSearchParams({ caller_address: callerAddress });
+  return doFetch<Earning[]>(stub, `/editor-earnings/${encodeURIComponent(editorAddress)}?${params}`);
+}
+
+/** Publisher records payout_txid on an editor earning. Publisher-only. Validates earning belongs to editorAddress. */
+export async function updateEditorEarning(
+  env: Env,
+  earningId: string,
+  editorAddress: string,
+  publisherAddress: string,
+  payout_txid: string
+): Promise<DOResult<Earning>> {
+  const stub = getStub(env);
+  return doFetch<Earning>(stub, `/editor-earnings/${encodeURIComponent(earningId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ btc_address: publisherAddress, editor_address: editorAddress, payout_txid }),
   });
 }
