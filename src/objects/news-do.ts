@@ -2257,20 +2257,8 @@ export class NewsDO extends DurableObject<Env> {
 
       // Simplified compile: the roster IS the set of approved signals for the day.
       // All curation happened at review time via cap-enforced approval.
-      // Count total candidates before applying the cap so overflow is reported accurately.
-      const totalCandidates = this.ctx.storage.sql
-        .exec(
-          `SELECT COUNT(*) as cnt FROM signals
-           WHERE created_at >= ?1 AND created_at < ?2
-             AND status IN ('approved', 'brief_included')`,
-          dayStart,
-          dayEnd
-        )
-        .toArray()[0]?.cnt as number ?? 0;
-
       // Include both 'approved' (new) and 'brief_included' (recompile) signals.
-      // Earliest-approved first; LIMIT enforces the 30-signal cap at the DB layer.
-      const selectedSignals = this.ctx.storage.sql
+      const candidateSignals = this.ctx.storage.sql
         .exec(
           `SELECT s.id, s.beat_slug, s.btc_address, s.headline, s.body, s.sources,
                   s.created_at, s.correction_of, s.reviewed_at,
@@ -2282,15 +2270,20 @@ export class NewsDO extends DurableObject<Env> {
            WHERE s.created_at >= ?1
              AND s.created_at < ?2
              AND s.status IN ('approved', 'brief_included')
-           ORDER BY s.reviewed_at ASC, s.created_at ASC, s.id ASC
-           LIMIT ?3`,
+           ORDER BY s.reviewed_at DESC, s.created_at DESC, s.id ASC`,
           dayStart,
-          dayEnd,
-          MAX_INCLUDED_SIGNALS_PER_BRIEF
+          dayEnd
         )
         .toArray()
         .map((row) => rowToCompiledSignal(row as Record<string, unknown>));
 
+      // Safety cap at MAX_INCLUDED_SIGNALS_PER_BRIEF. Candidates are already ordered by
+      // reviewed_at DESC, created_at DESC, id ASC above, so compilation deterministically
+      // includes the first N approved candidates for the day. This is the effective
+      // selection behavior whenever approvals exceed the brief limit.
+      // Note: fetches all candidates to preserve candidate_count accuracy; revisit
+      // with SQL LIMIT + separate COUNT if daily volumes grow significantly.
+      const selectedSignals = candidateSignals.slice(0, MAX_INCLUDED_SIGNALS_PER_BRIEF);
       const includedSignals = buildIncludedSignalMetadata(selectedSignals);
 
       const compiledAt = now.toISOString();
@@ -2300,8 +2293,8 @@ export class NewsDO extends DurableObject<Env> {
         signals: selectedSignals,
         included_signal_ids: includedSignals.map((signal) => signal.signal_id),
         included_signals: includedSignals,
-        candidate_count: totalCandidates,
-        overflow_count: Math.max(0, totalCandidates - MAX_INCLUDED_SIGNALS_PER_BRIEF),
+        candidate_count: candidateSignals.length,
+        overflow_count: Math.max(0, candidateSignals.length - MAX_INCLUDED_SIGNALS_PER_BRIEF),
       };
 
       return c.json({ ok: true, data } satisfies DOResult<CompiledBriefData>);
