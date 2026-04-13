@@ -5,7 +5,7 @@ import type { Env, Beat, Signal, SignalStatus, Streak, Brief, Classified, Classi
 import { validateSlug, validateHexColor, sanitizeString, validateDateFormat } from "../lib/validators";
 import { generateId, getPacificDate, getPacificYesterday, getPacificDayStartUTC, getPacificDayEndUTC, getNextDate } from "../lib/helpers";
 import { CLASSIFIED_DURATION_DAYS, CLASSIFIED_BRIEF_SLOTS, CLASSIFIED_BRIEF_MAX_CHARS, CLASSIFIED_STATUSES, SIGNAL_COOLDOWN_HOURS, BEAT_EXPIRY_DAYS, MAX_SIGNALS_PER_DAY, MAX_INCLUDED_SIGNALS_PER_BRIEF, MAX_APPROVED_SIGNALS_PER_DAY, SIGNAL_STATUSES, REVIEWABLE_SIGNAL_STATUSES, CONFIG_PUBLISHER_ADDRESS, BRIEF_INCLUSION_PAYOUT_SATS, WEEKLY_PRIZE_1ST_SATS, WEEKLY_PRIZE_2ND_SATS, WEEKLY_PRIZE_3RD_SATS, SCORING_WEIGHTS, PAYMENT_STAGE_TTL_MS } from "../lib/constants";
-import { SCHEMA_SQL, MIGRATION_PHASE0_SQL, MIGRATION_PAYMENTS_SQL, MIGRATION_BEAT_RESTRUCTURE_SQL, MIGRATION_SBTC_TRACKING_SQL, MIGRATION_CLASSIFIEDS_CLEANUP_SQL, MIGRATION_CLASSIFIEDS_REVIEW_SQL, MIGRATION_SNAPSHOTS_SQL, MIGRATION_BEAT_CLAIMS_SQL, MIGRATION_RETRACTION_SQL, MIGRATION_BEAT_NETWORK_FOCUS_SQL, MIGRATION_BITCOIN_MACRO_SQL, MIGRATION_QUANTUM_BEAT_SQL, MIGRATION_PAYMENT_STAGING_SQL, MIGRATION_APPROVAL_CAP_INDEX_SQL, MIGRATION_BEAT_EDITORS_SQL, MIGRATION_EDITORIAL_REVIEWS_SQL, MIGRATION_EDITOR_REVIEW_RATE_SQL, MIGRATION_CURATION_CLEANUP_SQL, MIGRATION_LEADERBOARD_INDEXES_SQL } from "./schema";
+import { SCHEMA_SQL, MIGRATION_PHASE0_SQL, MIGRATION_PAYMENTS_SQL, MIGRATION_BEAT_RESTRUCTURE_SQL, MIGRATION_SBTC_TRACKING_SQL, MIGRATION_CLASSIFIEDS_CLEANUP_SQL, MIGRATION_CLASSIFIEDS_REVIEW_SQL, MIGRATION_SNAPSHOTS_SQL, MIGRATION_BEAT_CLAIMS_SQL, MIGRATION_RETRACTION_SQL, MIGRATION_BEAT_NETWORK_FOCUS_SQL, MIGRATION_BITCOIN_MACRO_SQL, MIGRATION_QUANTUM_BEAT_SQL, MIGRATION_PAYMENT_STAGING_SQL, MIGRATION_APPROVAL_CAP_INDEX_SQL, MIGRATION_BEAT_EDITORS_SQL, MIGRATION_EDITORIAL_REVIEWS_SQL, MIGRATION_EDITOR_REVIEW_RATE_SQL, MIGRATION_CURATION_CLEANUP_SQL, MIGRATION_LEADERBOARD_INDEXES_SQL, MIGRATION_BEAT_CONSOLIDATION_SQL } from "./schema";
 
 // ── State machine transition maps ──
 // Hoisted to module level so they are created once and are testable.
@@ -286,7 +286,8 @@ export class NewsDO extends DurableObject<Env> {
     // 19 = Editor review rate — editor_review_rate_sats column on beats table
     // 20 = Curation cleanup — fix Mar 28-29 inscription IDs + void 312 orphaned earnings (#339)
     // 21 = Leaderboard composite indexes — accelerate 30-day rolling window queries (#319)
-    const CURRENT_MIGRATION_VERSION = 21;
+    // 22 = Beat consolidation — 12 → 3 beats, retire old beats, create aibtc-network (#423)
+    const CURRENT_MIGRATION_VERSION = 22;
     const versionRows = this.ctx.storage.sql
       .exec("SELECT value FROM config WHERE key = 'migration_version'")
       .toArray();
@@ -572,10 +573,35 @@ export class NewsDO extends DurableObject<Env> {
         }
       }
 
+      // Beat consolidation — 12 → 3 beats: create aibtc-network, retire old beats (#423).
+      // Tracks success so version only bumps if all statements pass.
+      let migration22Ok = appliedVersion >= 22; // already done
+      if (appliedVersion < 22) {
+        migration22Ok = true;
+        for (const stmt of MIGRATION_BEAT_CONSOLIDATION_SQL) {
+          try {
+            this.ctx.storage.sql.exec(stmt);
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            if (msg.includes("duplicate column")) {
+              // Phase A already applied — expected on re-run
+            } else {
+              console.error("Beat consolidation migration statement failed:", e);
+              migration22Ok = false;
+            }
+          }
+        }
+        if (!migration22Ok) {
+          console.error("Beat consolidation migration incomplete — will retry on next cold start");
+        }
+      }
+
       // Record current migration version so future cold starts skip all of the above.
+      // If migration 22 failed, cap at 21 so it retries on next cold start.
+      const versionToWrite = migration22Ok ? CURRENT_MIGRATION_VERSION : CURRENT_MIGRATION_VERSION - 1;
       this.ctx.storage.sql.exec(
         "INSERT INTO config (key, value) VALUES ('migration_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')",
-        String(CURRENT_MIGRATION_VERSION)
+        String(versionToWrite)
       );
     }
 
@@ -1007,6 +1033,19 @@ export class NewsDO extends DurableObject<Env> {
           ? (beatCapRows[0] as { daily_approved_limit: number | null }).daily_approved_limit
           : null;
 
+        // ── Global daily cap (MAX_APPROVED_SIGNALS_PER_DAY across all beats) ──
+        const globalCountRows = this.ctx.storage.sql
+          .exec(
+            `SELECT COUNT(*) as count FROM signals
+             WHERE status IN ('approved', 'brief_included')
+               AND reviewed_at >= ? AND reviewed_at < ?`,
+            dayStart, dayEnd
+          )
+          .toArray();
+        const globalRaw = (globalCountRows[0] as Record<string, unknown> | undefined)?.count;
+        const globalApprovedToday = Number.isFinite(Number(globalRaw)) ? Number(globalRaw) : 0;
+
+        // ── Per-beat cap (daily_approved_limit, only when set) ──
         // Skip per-beat cap enforcement when daily_approved_limit is NULL (unlimited)
         const enforceCapCheck = beatCap !== null;
         let approvedToday = 0;
@@ -1023,59 +1062,83 @@ export class NewsDO extends DurableObject<Env> {
           approvedToday = Number.isFinite(Number(rawCount)) ? Number(rawCount) : 0;
         }
 
-        if (enforceCapCheck && approvedToday >= beatCap) {
-          const displaceId = body.displace_signal_id as string | undefined;
+        // ── Determine if displacement is needed and validate upfront ──
+        // Both caps are checked before any mutation so the operation is all-or-nothing.
+        const globalCapHit = globalApprovedToday >= MAX_APPROVED_SIGNALS_PER_DAY;
+        const beatCapHit = enforceCapCheck && approvedToday >= beatCap;
+        let displaceId: string | undefined;
+
+        if (globalCapHit || beatCapHit) {
+          displaceId = body.displace_signal_id as string | undefined;
+          const capLabel = globalCapHit
+            ? `Global daily approval cap reached (${MAX_APPROVED_SIGNALS_PER_DAY})`
+            : `Daily approval cap reached (${beatCap} for beat "${signalRow.beat_slug}")`;
 
           if (!displaceId) {
             return c.json({
               ok: false,
-              error: `Daily approval cap reached (${beatCap} for beat "${signalRow.beat_slug}"). Provide displace_signal_id to swap.`,
-              approval_cap: {
-                limit: beatCap,
-                approved_today: approvedToday,
-                remaining: 0,
-                reset_at: dayEnd,
-              },
+              error: `${capLabel}. Provide displace_signal_id to swap.`,
+              approval_cap: globalCapHit
+                ? { limit: MAX_APPROVED_SIGNALS_PER_DAY, approved_today: globalApprovedToday, remaining: 0, reset_at: dayEnd }
+                : { limit: beatCap!, approved_today: approvedToday, remaining: 0, reset_at: dayEnd },
             } satisfies DOResult<Signal>, 409);
           }
 
           // Validate displacement target
           const displaceRows = this.ctx.storage.sql
-            .exec("SELECT id, status, reviewed_at FROM signals WHERE id = ?", displaceId)
+            .exec("SELECT id, status, reviewed_at, beat_slug FROM signals WHERE id = ?", displaceId)
             .toArray();
           if (displaceRows.length === 0) {
             return c.json({ ok: false, error: `Displace target "${displaceId}" not found` } satisfies DOResult<Signal>, 404);
           }
-          const displaceRow = displaceRows[0] as { id: string; status: string; reviewed_at: string | null };
+          const displaceRow = displaceRows[0] as { id: string; status: string; reviewed_at: string | null; beat_slug: string };
           if (displaceRow.status !== "approved") {
             return c.json({
               ok: false,
               error: `Displace target must have status "approved", got "${displaceRow.status}". Only "approved" signals can be displaced (not "brief_included" or other statuses).`,
             } satisfies DOResult<Signal>, 400);
           }
-          // Displacement target must have a reviewed_at timestamp and be from
-          // today (same Pacific day) — displacing older signals wouldn't free a slot.
           if (!displaceRow.reviewed_at || displaceRow.reviewed_at < dayStart || displaceRow.reviewed_at >= dayEnd) {
             return c.json({
               ok: false,
               error: `Displace target was not approved today. Only today's approved signals can be displaced.`,
             } satisfies DOResult<Signal>, 400);
           }
+          // When per-beat cap triggered the displacement, target must be on the same beat
+          if (beatCapHit && displaceRow.beat_slug !== signalRow.beat_slug) {
+            return c.json({
+              ok: false,
+              error: `Displace target is on beat "${displaceRow.beat_slug}" but this signal is on "${signalRow.beat_slug}". Per-beat displacement requires a target on the same beat.`,
+            } satisfies DOResult<Signal>, 400);
+          }
+        }
 
-          // Atomically displace: set old signal to 'replaced'
+        // All validations passed — now perform displacement if needed
+        if (displaceId) {
           this.ctx.storage.sql.exec(
             `UPDATE signals SET status = 'replaced', updated_at = ? WHERE id = ?`,
             nowDate.toISOString(), displaceId
           );
         }
 
-        // Build cap info for response (only when beat has a configured cap)
+        // Build cap info for response — always include global cap
+        const globalCountAfter = globalApprovedToday >= MAX_APPROVED_SIGNALS_PER_DAY ? globalApprovedToday : globalApprovedToday + 1;
         if (enforceCapCheck) {
           const countAfter = approvedToday >= beatCap ? approvedToday : approvedToday + 1;
           approvalCap = {
             limit: beatCap,
             approved_today: countAfter,
             remaining: Math.max(0, beatCap - countAfter),
+            reset_at: dayEnd,
+            global_limit: MAX_APPROVED_SIGNALS_PER_DAY,
+            global_approved_today: globalCountAfter,
+            global_remaining: Math.max(0, MAX_APPROVED_SIGNALS_PER_DAY - globalCountAfter),
+          };
+        } else {
+          approvalCap = {
+            limit: MAX_APPROVED_SIGNALS_PER_DAY,
+            approved_today: globalCountAfter,
+            remaining: Math.max(0, MAX_APPROVED_SIGNALS_PER_DAY - globalCountAfter),
             reset_at: dayEnd,
           };
         }
@@ -1130,7 +1193,7 @@ export class NewsDO extends DurableObject<Env> {
     // Beats CRUD
     // -------------------------------------------------------------------------
 
-    // GET /beats — list all beats ordered by name, with computed status
+    // GET /beats — list all beats ordered by name; retired status from DB, active/inactive computed from signal activity
     this.router.get("/beats", (c) => {
       const rows = this.ctx.storage.sql
         .exec(
@@ -1169,11 +1232,17 @@ export class NewsDO extends DurableObject<Env> {
       const now = Date.now();
       const beats = rows.map((r) => {
         const row = r as Record<string, unknown>;
-        const lastSignalAt = row.last_signal_at as string | null;
-        const status: "active" | "inactive" =
-          lastSignalAt && now - new Date(lastSignalAt).getTime() < expiryMs
-            ? "active"
-            : "inactive";
+        const storedStatus = row.status as string | null;
+        // Retired beats keep their stored status; others compute from activity
+        const status: "active" | "inactive" | "retired" =
+          storedStatus === "retired"
+            ? "retired"
+            : (() => {
+                const lastSignalAt = row.last_signal_at as string | null;
+                return lastSignalAt && now - new Date(lastSignalAt).getTime() < expiryMs
+                  ? "active"
+                  : "inactive";
+              })();
         return {
           slug: row.slug,
           name: row.name,
@@ -1231,7 +1300,7 @@ export class NewsDO extends DurableObject<Env> {
       } satisfies DOResult<{ agent: string; beats: Array<{ slug: string; joined_at: string; status: "active" }>; available_beats: string[] }>);
     });
 
-    // GET /beats/:slug — get a single beat by slug, with computed status
+    // GET /beats/:slug — get a single beat by slug; retired status from DB, active/inactive computed from signal activity
     this.router.get("/beats/:slug", (c) => {
       const slug = c.req.param("slug");
       const rows = this.ctx.storage.sql
@@ -1254,12 +1323,17 @@ export class NewsDO extends DurableObject<Env> {
         );
       }
       const row = rows[0] as Record<string, unknown>;
-      const lastSignalAt = row.last_signal_at as string | null;
-      const expiryMs = BEAT_EXPIRY_DAYS * 24 * 3600 * 1000;
-      const status: "active" | "inactive" =
-        lastSignalAt && Date.now() - new Date(lastSignalAt).getTime() < expiryMs
-          ? "active"
-          : "inactive";
+      const storedStatus = row.status as string | null;
+      const status: "active" | "inactive" | "retired" =
+        storedStatus === "retired"
+          ? "retired"
+          : (() => {
+              const lastSignalAt = row.last_signal_at as string | null;
+              const expiryMs = BEAT_EXPIRY_DAYS * 24 * 3600 * 1000;
+              return lastSignalAt && Date.now() - new Date(lastSignalAt).getTime() < expiryMs
+                ? "active"
+                : "inactive";
+            })();
 
       // Fetch members for this beat
       const memberRows = this.ctx.storage.sql
@@ -1351,6 +1425,12 @@ export class NewsDO extends DurableObject<Env> {
           slug as string
         )
         .toArray();
+      if (existing.length > 0 && (existing[0] as Record<string, unknown>).status === "retired") {
+        return c.json(
+          { ok: false, error: `Beat "${slug as string}" is retired and no longer accepts new members` } satisfies DOResult<Beat>,
+          410
+        );
+      }
       if (existing.length > 0) {
         const row = existing[0] as Record<string, unknown>;
         const lastSignalAt = row.last_signal_at as string | null;
@@ -1899,14 +1979,20 @@ export class NewsDO extends DurableObject<Env> {
 
       const { beat_slug, btc_address, headline, body: signalBody, sources, tags } = body;
 
-      // Validate beat exists
+      // Validate beat exists and is not retired
       const beatRows = this.ctx.storage.sql
-        .exec("SELECT 1 FROM beats WHERE slug = ?", beat_slug as string)
+        .exec("SELECT status FROM beats WHERE slug = ?", beat_slug as string)
         .toArray();
       if (beatRows.length === 0) {
         return c.json(
           { ok: false, error: `Beat "${beat_slug as string}" not found` } satisfies DOResult<Signal>,
           404
+        );
+      }
+      if ((beatRows[0] as Record<string, unknown>).status === "retired") {
+        return c.json(
+          { ok: false, error: `Beat "${beat_slug as string}" is retired and no longer accepts new signals` } satisfies DOResult<Signal>,
+          410
         );
       }
 

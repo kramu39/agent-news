@@ -138,8 +138,8 @@ export interface Beat {
   readonly daily_approved_limit?: number | null;
   /** Per-review payment rate for the beat editor in satoshis (null = not configured). Added in migration 19. */
   readonly editor_review_rate_sats?: number | null;
-  /** Computed on read — not stored in DB */
-  readonly status?: "active" | "inactive";
+  /** "retired" is stored in DB (migration 22); "active"/"inactive" computed from signal activity */
+  readonly status?: "active" | "inactive" | "retired";
   /** Active members from beat_claims — populated when joined */
   readonly members?: BeatMember[];
 }
@@ -374,6 +374,10 @@ export interface ApprovalCapInfo {
   approved_today: number;
   remaining: number;
   reset_at: string;
+  /** Present when per-beat cap is active — global cap details */
+  global_limit?: number;
+  global_approved_today?: number;
+  global_remaining?: number;
 }
 
 export interface DOResult<T> {
