@@ -3,7 +3,7 @@ import type { Env, AppVariables } from "../lib/types";
 import { createRateLimitMiddleware } from "../middleware/rate-limit";
 import { BEAT_RATE_LIMIT } from "../lib/constants";
 import { validateSlug, validateHexColor, validateBtcAddress, sanitizeString } from "../lib/validators";
-import { listBeats, getBeat, createBeat, updateBeat, deleteBeat, getBeatMembership, getConfig } from "../lib/do-client";
+import { getBeat, createBeat, updateBeat, deleteBeat, getBeatMembership, getConfig, getActiveBeatSlugs, listBeats } from "../lib/do-client";
 import { CONFIG_PUBLISHER_ADDRESS } from "../lib/constants";
 import { verifyAuth } from "../services/auth";
 
@@ -78,6 +78,18 @@ beatsRouter.get("/api/beats/:slug", async (c) => {
   if (!b) {
     return c.json({ error: `Beat "${slug}" not found` }, 404);
   }
+
+  if (b.status === "retired") {
+    const activeBeats = await getActiveBeatSlugs(c.env);
+    return c.json(
+      {
+        error: `Beat "${slug}" is retired and no longer accepts signals.`,
+        active_beats: activeBeats,
+      },
+      410
+    );
+  }
+
   const members = b.members ?? [];
   const includeMembers = c.req.query("include") === "members";
   c.header("Cache-Control", "public, max-age=60, s-maxage=300");
