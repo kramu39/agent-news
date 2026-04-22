@@ -102,6 +102,8 @@
     "production": {
       "name": "agent-news",
       "placement": { "mode": "smart" },
+      "workers_dev": true,
+      "preview_urls": true,
 
       "vars": {
         "ENVIRONMENT": "production",
