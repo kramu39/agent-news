@@ -3090,9 +3090,18 @@
 
     async function init() {
       try {
-        // Single request replaces 5 parallel API calls — one DO round-trip instead of 5.
-        // Falls back to individual calls if /api/init returns null (fetchJSON returns null on error).
-        let data = await fetchJSON('/api/init');
+        // Sync cache hit on /api/init → skip the await round-trip and paint
+        // immediately. Same data shape as the async path, so downstream code
+        // doesn't branch — only the initial source differs. cachedJSONSync
+        // is provided by shared.js; fall through to async if not loaded yet.
+        let data = (typeof cachedJSONSync === 'function')
+          ? cachedJSONSync('/api/init')
+          : null;
+        if (!data) {
+          // Single request replaces 5 parallel API calls — one DO round-trip instead of 5.
+          // Falls back to individual calls if /api/init returns null (fetchJSON returns null on error).
+          data = await fetchJSON('/api/init');
+        }
         if (!data) {
           const [briefRes, beatsRes, classifiedsRes, correspondentsRes, signalsRes] = await Promise.allSettled([
             fetchJSON('/api/brief?format=json'),
@@ -3161,8 +3170,15 @@
           renderLeaderboard(correspondentsList);
         }
 
-        renderBeatsRail();
-        renderWire();
+        // Lazy-trigger heavy renders so they don't fire all their fetches up
+        // front. Today's Beats fires 6+ API calls (3 counts + 3 signals + 1
+        // hourly + brief) and The Wire fires 1 — defer both until their
+        // section nears the viewport. With a 400px rootMargin the fetch
+        // starts well before the section is actually visible, so the user
+        // doesn't perceive the lag. Falls back to immediate invocation when
+        // IntersectionObserver isn't available (whenVisible from shared.js).
+        whenVisible(el('beats-rail'), renderBeatsRail);
+        whenVisible(el('wire-section'), renderWire);
 
         // Section reveal animations
         document.querySelectorAll('.roster-section, .leaderboard-section, .marketplace-section').forEach(el => {
@@ -4382,9 +4398,13 @@
       // tiles showed yesterday-afternoon approvals lingering in the window.
       // The sparkline still uses a rolling 24h fetch so the trend bars span
       // across the midnight boundary (visualization intent != count intent).
-      const todayUtcMidnight = new Date().toISOString().slice(0, 10) + 'T00:00:00Z';
-      const since24h = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-      const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      // Bucket the rolling timestamps so consecutive navigations hit the
+      // cachedJSON sessionStorage cache instead of re-fetching every time
+      // (URL = cache key; ms-precision timestamps make every key unique).
+      // 5-min bucket on the 24h sparkline window, 1-min on the per-hour gauge.
+      const todayUtcMidnight = sinceUtcMidnightIso();
+      const since24h = bucketedSinceIso(24 * 3600 * 1000, 5 * 60 * 1000);
+      const oneHourAgo = bucketedSinceIso(60 * 60 * 1000, 60 * 1000);
       const top = active.slice(0, 3);
 
       // Fire EVERY rail fetch in parallel up front so cold-start latency on any
@@ -4565,18 +4585,8 @@
     }
 
     // ── The Wire (dense signal rows below the brief) ──
-    async function renderWire() {
-      const section = el('wire-section');
-      const container = el('wire-rows');
-      if (!section || !container) return;
-
-      let signals = [];
-      try {
-        const data = await fetchJSON('/api/signals?limit=10');
-        signals = (data && Array.isArray(data.signals)) ? data.signals : [];
-      } catch { /* empty render */ }
+    function paintWireRows(section, container, signals) {
       if (!signals.length) return;
-
       const beatLetter = (b) => (b || '?').replace(/[^A-Za-z]/g, '').charAt(0).toUpperCase() || '?';
       const now = Date.now();
 
@@ -4627,6 +4637,28 @@
       });
 
       section.style.display = '';
+    }
+
+    async function renderWire() {
+      const section = el('wire-section');
+      const container = el('wire-rows');
+      if (!section || !container) return;
+
+      // Sync cache hit → paint immediately, no skeleton flash. The /api/signals
+      // payload is cached at 30s in shared.js; revalidation happens on the
+      // next page load when the entry expires.
+      const url = '/api/signals?limit=10';
+      const cached = (typeof cachedJSONSync === 'function') ? cachedJSONSync(url) : null;
+      if (cached && Array.isArray(cached.signals)) {
+        paintWireRows(section, container, cached.signals);
+        return;
+      }
+      let signals = [];
+      try {
+        const data = await fetchJSON(url);
+        signals = (data && Array.isArray(data.signals)) ? data.signals : [];
+      } catch { /* empty render */ }
+      paintWireRows(section, container, signals);
     }
 
     // ── Marketplace ──
