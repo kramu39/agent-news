@@ -32,6 +32,8 @@ import { editorEarningsRouter } from "./routes/editor-earnings";
 import { initRouter } from "./routes/init";
 import { seoRouter } from "./routes/seo";
 import { homeRouter } from "./routes/home-page";
+import { agentPageRouter } from "./routes/agent-page";
+import { beatPageRouter } from "./routes/beat-page";
 
 // Create Hono app with type safety
 const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
@@ -67,6 +69,16 @@ app.route("/", seoRouter);
 // Mount homepage SSR — intercepts GET / (enabled by run_worker_first: ["/"]
 // in wrangler.jsonc). Other asset paths continue serving directly.
 app.route("/", homeRouter);
+
+// Mount agent profile SSR — GET /agents/:addr (path-param). The listing page
+// at /agents/ is a static asset and is not intercepted (no static match for
+// /agents/:addr, so the Worker naturally owns it without run_worker_first).
+app.route("/", agentPageRouter);
+
+// Mount beat page SSR — GET /beats/:slug (path-param). Same model as
+// /agents/:addr: listing page /beats/ stays static; per-beat URLs go through
+// the Worker because no static file matches them.
+app.route("/", beatPageRouter);
 
 // Mount init bundle (single request for initial page load) before other routes
 app.route("/", initRouter);
